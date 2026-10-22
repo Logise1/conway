@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Juego de la Vida - Diagonal Drift</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+
+        body,
+        html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #ffffff;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            touch-action: none;
+            cursor: crosshair;
+        }
+    </style>
+</head>
+
+<body class="bg-white">
+
+    <!-- Solo el canvas en toda la pantalla, sin ningún elemento de GUI -->
+    <canvas id="lifeCanvas"></canvas>
+
+    <script>
+        // Configuración del tamaño del grid
+        const CELL_SIZE = 22; // Tamaño de cada celda
+        const DRIFT_SPEED_X = 16; // Píxeles por segundo en X
+        const DRIFT_SPEED_Y = 16; // Píxeles por segundo en Y
+        const LIFE_STEP_INTERVAL = 110; // Milisegundos por generación Conway
+        const EMPTY_AREA_INTERVAL = 300; // Comprobación continua cada 300ms de áreas 8x8 vacías
+
+        const canvas = document.getElementById('lifeCanvas');
+        const ctx = canvas.getContext('2d', { alpha: false });
+
+        let width = 0;
+        let height = 0;
+        let cols = 0;
+        let rows = 0;
+
+        // Estados del autómata celular
+        let grid = null;
+        let nextGrid = null;
+        // Escala continua de animación (0.0 -> invisible, 1.0 -> tamaño completo)
+        let animScale = null;
+
+        // Posición continua del mundo en píxeles (acumulador suave sin saltos)
+        let worldPosX = 0;
+        let worldPosY = 0;
+
+        // Seguimiento de pasos de celda para limpiar buffer y spawnear en la esquina entrante
+        let lastStepX = 0;
+        let lastStepY = 0;
+
+        // Control de tiempo
+        let lastTime = performance.now();
+        let lifeTimer = 0;
+        let emptyAreaTimer = 0;
+
+        // Mapeo seguro de cualquier coordenada entera global (gx, gy) al buffer toroidal
+        function getBufferIndex(gx, gy) {
+            const c = ((gx % cols) + cols) % cols;
+            const r = ((gy % rows) + rows) % rows;
+            return r * cols + c;
+        }
+
+        function getCell(gx, gy) {
+            return grid[getBufferIndex(gx, gy)];
+        }
+
+        function setCellWithZoom(gx, gy) {
+            const idx = getBufferIndex(gx, gy);
+            grid[idx] = 1;
+            if (animScale[idx] < 0.1) {
+                animScale[idx] = 0.05;
+            }
+        }
+
+        function clearGrid() {
+            if (grid) grid.fill(0);
+            if (nextGrid) nextGrid.fill(0);
+            if (animScale) animScale.fill(0);
+        }
+
+        // Ajuste dinámico de dimensiones sin alterar la posición global
+        function resize() {
+            const dpr = window.devicePixelRatio || 1;
+            width = window.innerWidth;
+            height = window.innerHeight;
+
+            canvas.width = Math.floor(width * dpr);
+            canvas.height = Math.floor(height * dpr);
+            ctx.scale(dpr, dpr);
+
+            // Margen amplio de celdas de seguridad fuera de pantalla
+            const newCols = Math.ceil(width / CELL_SIZE) + 24;
+            const newRows = Math.ceil(height / CELL_SIZE) + 24;
+
+            const newGrid = new Uint8Array(newCols * newRows);
+            const newNext = new Uint8Array(newCols * newRows);
+            const newAnim = new Float32Array(newCols * newRows);
+
+            if (grid) {
+                const minGx = Math.floor((-worldPosX) / CELL_SIZE) - 2;
+                const maxGx = Math.ceil((width - worldPosX) / CELL_SIZE) + 2;
+                const minGy = Math.floor((-worldPosY) / CELL_SIZE) - 2;
+                const maxGy = Math.ceil((height - worldPosY) / CELL_SIZE) + 2;
+
+                for (let gy = minGy; gy <= maxGy; gy++) {
+                    const oldR = ((gy % rows) + rows) % rows;
+                    const newR = ((gy % newRows) + newRows) % newRows;
+                    for (let gx = minGx; gx <= maxGx; gx++) {
+                        const oldC = ((gx % cols) + cols) % cols;
+                        const newC = ((gx % newCols) + newCols) % newCols;
+
+                        const oldIdx = oldR * cols + oldC;
+                        const newIdx = newR * newCols + newC;
+
+                        newGrid[newIdx] = grid[oldIdx];
+                        newAnim[newIdx] = animScale[oldIdx];
+                    }
+                }
+            }
+
+            cols = newCols;
+            rows = newRows;
+            grid = newGrid;
+            nextGrid = newNext;
+            animScale = newAnim;
+        }
+
+        // Patrones variados listos para brotar
+        const PATTERNS = [
+            // Glider hacia abajo-derecha (en dirección al drift)
+            [[1, 0], [2, 1], [0, 2], [1, 2], [2, 2]],
+            // Glider invertido
+            [[0, 1], [1, 2], [2, 0], [2, 1], [2, 2]],
+            // R-Pentomino (caótico y prolífico)
+            [[1, 0], [2, 0], [0, 1], [1, 1], [1, 2]],
+            // Toad (oscilador parpadeante)
+            [[1, 0], [2, 0], [3, 0], [0, 1], [1, 1], [2, 1]],
+            // Beacon (faro)
+            [[0, 0], [1, 0], [0, 1], [3, 2], [2, 3], [3, 3]],
+            // Nave espacial ligera (LWSS)
+            [[0, 0], [3, 0], [4, 1], [0, 2], [4, 2], [1, 3], [2, 3], [3, 3], [4, 3]],
+            // Acorn (semilla generadora)
+            [[1, 0], [3, 1], [0, 2], [1, 2], [4, 2], [5, 2], [6, 2]],
+            // Semilla orgánica compacta
+            [[0, 0], [1, 0], [2, 1], [0, 1], [1, 2]]
+        ];
+
+        // Comprueba si un bloque de tamaño size x size está totalmente vacío
+        function isBlockEmpty(gx, gy, size = 8) {
+            for (let dy = 0; dy < size; dy++) {
+                for (let dx = 0; dx < size; dx++) {
+                    if (getCell(gx + dx, gy + dy) === 1) return false;
+                }
+            }
+            return true;
+        }
+
+        // Detecta constantemente áreas de 8x8 vacías en pantalla y spawnea vida
+        function scanAndPopulateEmptyAreas() {
+            if (!grid) return;
+
+            const minGx = Math.floor((-worldPosX) / CELL_SIZE);
+            const maxGx = Math.ceil((width - worldPosX) / CELL_SIZE);
+            const minGy = Math.floor((-worldPosY) / CELL_SIZE);
+            const maxGy = Math.ceil((height - worldPosY) / CELL_SIZE);
+
+            const emptyBlocks = [];
+            const stepSize = 6; // Paso con ligero solapamiento para cubrir el área visible
+
+            for (let gy = minGy + 1; gy <= maxGy - 8; gy += stepSize) {
+                for (let gx = minGx + 1; gx <= maxGx - 8; gx += stepSize) {
+                    if (isBlockEmpty(gx, gy, 8)) {
+                        emptyBlocks.push({ gx, gy });
+                    }
+                }
+            }
+
+            if (emptyBlocks.length === 0) return;
+
+            // Barajamos candidatos para una distribución orgánica
+            for (let i = emptyBlocks.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [emptyBlocks[i], emptyBlocks[j]] = [emptyBlocks[j], emptyBlocks[i]];
+            }
+
+            // Spawn gradual para que aparezcan de forma agradable y continua
+            const maxSpawns = Math.min(3, emptyBlocks.length);
+            let spawnedCount = 0;
+
+            for (const block of emptyBlocks) {
+                if (spawnedCount >= maxSpawns) break;
+
+                // Verificamos de nuevo por si un patrón recién colocado solapa con este bloque
+                if (isBlockEmpty(block.gx, block.gy, 8)) {
+                    const pattern = PATTERNS[Math.floor(Math.random() * PATTERNS.length)];
+                    const targetX = block.gx + 2 + Math.floor(Math.random() * 2);
+                    const targetY = block.gy + 2 + Math.floor(Math.random() * 2);
+
+                    pattern.forEach(([dx, dy]) => {
+                        setCellWithZoom(targetX + dx, targetY + dy);
+                    });
+                    spawnedCount++;
+                }
+            }
+        }
+
+        // Genera vida continuamente en la esquina y bordes entrantes (fuera de pantalla, antes de entrar)
+        function spawnIncomingLife(cornerGx, cornerGy) {
+            // 1. Spawneo en la esquina entrante (aparece con frecuencia al avanzar)
+            if (Math.random() < 0.5) {
+                const pattern = PATTERNS[Math.floor(Math.random() * PATTERNS.length)];
+                const ox = cornerGx + Math.floor(Math.random() * 3);
+                const oy = cornerGy + Math.floor(Math.random() * 3);
+                pattern.forEach(([dx, dy]) => {
+                    setCellWithZoom(ox + dx, oy + dy);
+                });
+            }
+
+            // 2. Semillas aleatorias o pequeños grupos a lo largo del borde que entra
+            const minGy = Math.floor((-worldPosY) / CELL_SIZE) - 2;
+            const maxGy = Math.ceil((height - worldPosY) / CELL_SIZE) + 2;
+            const minGx = Math.floor((-worldPosX) / CELL_SIZE) - 2;
+            const maxGx = Math.ceil((width - worldPosX) / CELL_SIZE) + 2;
+
+            // Borde vertical entrante
+            for (let gy = minGy; gy <= maxGy; gy += 4) {
+                if (Math.random() < 0.2) {
+                    setCellWithZoom(cornerGx, gy);
+                    if (Math.random() < 0.5) setCellWithZoom(cornerGx, gy + 1);
+                }
+            }
+
+            // Borde horizontal entrante
+            for (let gx = minGx; gx <= maxGx; gx += 4) {
+                if (Math.random() < 0.2) {
+                    setCellWithZoom(gx, cornerGy);
+                    if (Math.random() < 0.5) setCellWithZoom(gx + 1, cornerGy);
+                }
+            }
+        }
+
+        // Inicialización de vida
+        function seedLife() {
+            clearGrid();
+            // Llenamos la pantalla inicial detectando y poblando áreas vacías
+            for (let i = 0; i < 10; i++) {
+                scanAndPopulateEmptyAreas();
+            }
+        }
+
+        // Evolución de Conway
+        function stepLife() {
+            for (let r = 0; r < rows; r++) {
+                const rPrev = (r - 1 + rows) % rows;
+                const rNext = (r + 1) % rows;
+                const rOffset = r * cols;
+                const rPrevOffset = rPrev * cols;
+                const rNextOffset = rNext * cols;
+
+                for (let c = 0; c < cols; c++) {
+                    const cPrev = (c - 1 + cols) % cols;
+                    const cNext = (c + 1) % cols;
+
+                    const neighbors =
+                        grid[rPrevOffset + cPrev] +
+                        grid[rPrevOffset + c] +
+                        grid[rPrevOffset + cNext] +
+                        grid[rOffset + cPrev] +
+                        grid[rOffset + cNext] +
+                        grid[rNextOffset + cPrev] +
+                        grid[rNextOffset + c] +
+                        grid[rNextOffset + cNext];
+
+                    const idx = rOffset + c;
+                    const current = grid[idx];
+
+                    if (current === 1) {
+                        nextGrid[idx] = (neighbors === 2 || neighbors === 3) ? 1 : 0;
+                    } else {
+                        nextGrid[idx] = (neighbors === 3) ? 1 : 0;
+                        // Si nace por evolución, iniciamos animación de escala suave
+                        if (nextGrid[idx] === 1 && animScale[idx] < 0.1) {
+                            animScale[idx] = 0.1;
+                        }
+                    }
+                }
+            }
+
+            const temp = grid;
+            grid = nextGrid;
+            nextGrid = temp;
+        }
+
+        // Bucle continuo
+        function loop(now) {
+            requestAnimationFrame(loop);
+
+            const dt = Math.min((now - lastTime) / 1000, 0.05);
+            lastTime = now;
+
+            // Desplazamiento continuo en píxeles (completamente continuo, sin ningún salto de posición)
+            worldPosX += DRIFT_SPEED_X * dt;
+            worldPosY += DRIFT_SPEED_Y * dt;
+
+            // Comprobamos si la cámara ha avanzado celdas para limpiar el borde que entra y generar vida
+            const currentStepX = Math.floor(worldPosX / CELL_SIZE);
+            const currentStepY = Math.floor(worldPosY / CELL_SIZE);
+
+            if (currentStepX !== lastStepX) {
+                const deltaX = currentStepX - lastStepX;
+                for (let s = 1; s <= deltaX; s++) {
+                    const enteringGx = Math.floor((- (lastStepX + s) * CELL_SIZE) / CELL_SIZE) - 1;
+                    const cToClear = ((enteringGx % cols) + cols) % cols;
+                    for (let r = 0; r < rows; r++) {
+                        const idx = r * cols + cToClear;
+                        grid[idx] = 0;
+                        animScale[idx] = 0;
+                    }
+                }
+                lastStepX = currentStepX;
+
+                const cornerGx = Math.floor((-worldPosX) / CELL_SIZE) - 1;
+                const cornerGy = Math.floor((-worldPosY) / CELL_SIZE) - 1;
+                spawnIncomingLife(cornerGx, cornerGy);
+            }
+
+            if (currentStepY !== lastStepY) {
+                const deltaY = currentStepY - lastStepY;
+                for (let s = 1; s <= deltaY; s++) {
+                    const enteringGy = Math.floor((- (lastStepY + s) * CELL_SIZE) / CELL_SIZE) - 1;
+                    const rToClear = ((enteringGy % rows) + rows) % rows;
+                    for (let c = 0; c < cols; c++) {
+                        const idx = rToClear * cols + c;
+                        grid[idx] = 0;
+                        animScale[idx] = 0;
+                    }
+                }
+                lastStepY = currentStepY;
+
+                const cornerGx = Math.floor((-worldPosX) / CELL_SIZE) - 1;
+                const cornerGy = Math.floor((-worldPosY) / CELL_SIZE) - 1;
+                spawnIncomingLife(cornerGx, cornerGy);
+            }
+
+            // Detección constante de áreas vacías de 8x8 para spawnear cosas
+            emptyAreaTimer += dt * 1000;
+            if (emptyAreaTimer >= EMPTY_AREA_INTERVAL) {
+                scanAndPopulateEmptyAreas();
+                emptyAreaTimer = 0;
+            }
+
+            // Ciclo de Conway
+            lifeTimer += dt * 1000;
+            if (lifeTimer >= LIFE_STEP_INTERVAL) {
+                stepLife();
+                lifeTimer = 0;
+            }
+
+            // Animación suave de escala bidireccional (zoom in / zoom out)
+            const zoomInSpeed = 9.0 * dt;
+            const zoomOutSpeed = 7.5 * dt;
+
+            for (let i = 0; i < animScale.length; i++) {
+                if (grid[i] === 1) {
+                    if (animScale[i] < 1.0) {
+                        animScale[i] = Math.min(1.0, animScale[i] + zoomInSpeed);
+                    }
+                } else {
+                    if (animScale[i] > 0.0) {
+                        animScale[i] = Math.max(0.0, animScale[i] - zoomOutSpeed);
+                    }
+                }
+            }
+
+            // 1. Limpieza a fondo blanco puro
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, width, height);
+
+            // 2. Líneas grises de la cuadrícula en desplazamiento infinito continuo
+            ctx.strokeStyle = '#e5e7eb';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+
+            const screenOffsetX = ((worldPosX % CELL_SIZE) + CELL_SIZE) % CELL_SIZE;
+            const screenOffsetY = ((worldPosY % CELL_SIZE) + CELL_SIZE) % CELL_SIZE;
+
+            for (let x = screenOffsetX - CELL_SIZE; x <= width + CELL_SIZE; x += CELL_SIZE) {
+                const drawX = Math.floor(x) + 0.5;
+                ctx.moveTo(drawX, 0);
+                ctx.lineTo(drawX, height);
+            }
+
+            for (let y = screenOffsetY - CELL_SIZE; y <= height + CELL_SIZE; y += CELL_SIZE) {
+                const drawY = Math.floor(y) + 0.5;
+                ctx.moveTo(0, drawY);
+                ctx.lineTo(width, drawY);
+            }
+            ctx.stroke();
+
+            // 3. Renderizado de celdas negras con animación de Zoom In y Zoom Out
+            ctx.fillStyle = '#111827';
+            const cellInner = CELL_SIZE - 2;
+
+            const minGx = Math.floor((-worldPosX) / CELL_SIZE) - 1;
+            const maxGx = Math.ceil((width - worldPosX) / CELL_SIZE) + 1;
+            const minGy = Math.floor((-worldPosY) / CELL_SIZE) - 1;
+            const maxGy = Math.ceil((height - worldPosY) / CELL_SIZE) + 1;
+
+            for (let gy = minGy; gy <= maxGy; gy++) {
+                const screenY = gy * CELL_SIZE + worldPosY;
+                const r = ((gy % rows) + rows) % rows;
+                const rOffset = r * cols;
+
+                for (let gx = minGx; gx <= maxGx; gx++) {
+                    const screenX = gx * CELL_SIZE + worldPosX;
+                    const c = ((gx % cols) + cols) % cols;
+                    const idx = rOffset + c;
+
+                    const scale = animScale[idx];
+                    if (scale <= 0.01) continue;
+
+                    const currentSize = cellInner * scale;
+                    const centerOffset = (CELL_SIZE - currentSize) / 2;
+
+                    ctx.fillRect(
+                        screenX + centerOffset,
+                        screenY + centerOffset,
+                        currentSize,
+                        currentSize
+                    );
+                }
+            }
+        }
+
+        // Interacción táctil y ratón con animación suave de nacimiento
+        let isDrawing = false;
+
+        function handlePointer(e) {
+            if (!grid) return;
+            const rect = canvas.getBoundingClientRect();
+            const clientX = e.clientX ?? (e.touches && e.touches[0].clientX);
+            const clientY = e.clientY ?? (e.touches && e.touches[0].clientY);
+
+            if (clientX === undefined || clientY === undefined) return;
+
+            const px = clientX - rect.left;
+            const py = clientY - rect.top;
+
+            const targetGx = Math.floor((px - worldPosX) / CELL_SIZE);
+            const targetGy = Math.floor((py - worldPosY) / CELL_SIZE);
+
+            setCellWithZoom(targetGx, targetGy);
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            isDrawing = true;
+            handlePointer(e);
+        });
+        window.addEventListener('mousemove', (e) => {
+            if (isDrawing) handlePointer(e);
+        });
+        window.addEventListener('mouseup', () => {
+            isDrawing = false;
+        });
+
+        canvas.addEventListener('touchstart', (e) => {
+            isDrawing = true;
+            handlePointer(e);
+        }, { passive: true });
+        window.addEventListener('touchmove', (e) => {
+            if (isDrawing) handlePointer(e);
+        }, { passive: true });
+        window.addEventListener('touchend', () => {
+            isDrawing = false;
+        });
+
+        window.addEventListener('resize', resize);
+        window.onload = () => {
+            resize();
+            seedLife();
+            requestAnimationFrame(loop);
+        };
+    </script>
+</body>
+
+</html>
